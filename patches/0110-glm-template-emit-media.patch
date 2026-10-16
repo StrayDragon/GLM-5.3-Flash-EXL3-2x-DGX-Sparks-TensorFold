@@ -1,0 +1,59 @@
+# The upstream checkpoint ships a newer chat_template.jinja: per-kind media macros
+# (emit_image / emit_video / emit_audio) instead of one branch printing a "cannot
+# process" reminder, a clear_thinking default, and stricter tool-result pairing.
+# 0003/0056 patched the old branch by exact string, which breaks on the new one;
+# accept both shapes.  TF_GLM_TMPL, when set, names a chat_template.jinja that
+# wins over the snapshot's copy, so a template fix is a restart, not a rebuild.
+# The override is compiled as ChatTemplate jinja (from_string), not passed as the
+# ThinkingOffTemplate inner: a Path has no render, and the first chat 500'd.
+# MiaAI-Lab, Apache-2.0.
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -64,16 +64,32 @@
+           "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>"
+           "{%- else -%}" + _NO_MEDIA + "{%- endif -%}")
+ 
+ 
++def _glm_tmpl_text(model_dir) -> str:
++    """The snapshot's chat_template.jinja, or TF_GLM_TMPL when set (a file, or a directory that holds one)."""
++
++    override = os.environ.get("TF_GLM_TMPL", "").strip()
++    path = Path(override) if override else Path(model_dir) / "chat_template.jinja"
++    if override and path.is_dir():
++        path = path / "chat_template.jinja"
++    return path.read_text()
++
++
+ def media_template(inner, model_dir) -> None:
+     """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
+ 
+-    source = (model_dir / "chat_template.jinja").read_text()
+-    if source.count(_NO_MEDIA) != 1:
+-        raise ValueError("--vision: this checkpoint's chat template has no media branch TensorFold knows how to "
+-                         "extend (GLM-5.3 Flash's chat_template.jinja)")
+-    inner.template = inner.template.environment.from_string(source.replace(_NO_MEDIA, _MEDIA))
++    source = _glm_tmpl_text(model_dir)
++    mark = "{%- if item.tf_mark is defined -%}{{- item.tf_mark -}}{%- endif -%}"
++    if "macro emit_image" in source:      # newer upstream template: per-kind macros already emit GLM markers
++        if mark not in source:
++            source = source.replace("{{- emit_image() -}}", mark + "{{- emit_image() -}}")
++            source = source.replace("{{- emit_video() -}}", mark + "{{- emit_video() -}}")
++    elif source.count(_NO_MEDIA) == 1:    # the older template's single reminder branch
++        source = source.replace(_NO_MEDIA, _MEDIA)
++    else:
++        raise ValueError("--vision: no known media branch in the chat template")
++    inner.template = inner.template.environment.from_string(source)
+ 
+ 
+ class GlmApp(App):
+     reads_ignore_eos = True             # ``run`` hands it to the engine's request
+@@ -90,6 +106,9 @@ class GlmApp(App):
+             raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
+         effort_tail_enabled()       # a typo fails at load, not at the first request
++        if os.environ.get("TF_GLM_TMPL", "").strip() and self.vision is None:
++            self.template.template = self.template.template.environment.from_string(
++                _glm_tmpl_text(Path(model_dir)))
+         self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
